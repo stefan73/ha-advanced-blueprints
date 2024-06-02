@@ -4,6 +4,7 @@
 # -------------------------------------------------
 from typing import Union
 import math
+import numpy
 
 
 def _get_state(entity_id: str) -> Union[str, None]:
@@ -228,6 +229,7 @@ class PvExcessControl:
         self.domain = self.appliance_switch.split('.')[0]
 
         # start if needed
+        #log.info(f'test: {state.names(domain=None)}')
         if self.automation_id not in PvExcessControl.instances:
             self.trigger_factory()
             log.info(f'{self.log_prefix} Trigger Method started.')
@@ -236,6 +238,7 @@ class PvExcessControl:
         PvExcessControl.instances = dict(sorted(PvExcessControl.instances.items(), key=lambda item: item[1]['priority'], reverse=True))
         log.info(f'{self.log_prefix} Registered appliance.')
         log.info(f'Dict: {PvExcessControl.instances}')
+        #log.info(f'self: {dir(self)}')
 
     def trigger_factory(self):
         # trigger every 10s
@@ -278,26 +281,29 @@ class PvExcessControl:
                     home_battery_level = _get_num_state(PvExcessControl.home_battery_level)
                 if home_battery_level >= PvExcessControl.min_home_battery_level or not self._force_charge_battery():
                     # home battery charge is high enough to direct solar power to appliances, if solar power is higher than load power
-                    # calc min based on pv excess (solar power - load power) according to specified window
+                    # calc min & median based on pv excess (solar power - load power) according to specified window.
+                    # Use min to decide whether to turn on and median for bookkeeping and turning off
                     # original code used average here - this has two issues:
                     # 1. wallboxes / car chargers as dynamic appliances do not toggle power immediately - average overestimates pv excess power
                     # 2. average is prone create overshoots with fluctuations in pv power
-                    avg_excess_power = int(min(PvExcessControl.pv_history[-inst.appliance_switch_interval:]))
+                    minimum_excess_power = int(min(PvExcessControl.pv_history[-inst.appliance_switch_interval:]))
+                    median_excess_power = int(numpy.median(PvExcessControl.pv_history[-inst.appliance_switch_interval:]))
                     log.debug(f'{log_prefix} Home battery charge is sufficient ({home_battery_level}/{PvExcessControl.min_home_battery_level} %)'
                               f' OR remaining solar forecast is higher than remaining capacity of home battery. '
-                              f'Calculated average excess power based on >> solar power - load power <<: {avg_excess_power} W')
+                              f'Calculated median excess power based on >> solar power - load power <<: {median_excess_power} W')
 
                 else:
                     # home battery charge is not yet high enough OR battery force charge is necessary.
                     # Only use excess power (which would otherwise be exported to the grid) for appliance
-                    # calc min based on export power history according to specified window
-                    avg_excess_power = int(min(PvExcessControl.export_history[-inst.appliance_switch_interval:]))
+                    # calc min & median based on export power history according to specified window
+                    minimum_excess_power = int(min(PvExcessControl.export_history[-inst.appliance_switch_interval:]))
+                    median_excess_power = int(numpy.median(PvExcessControl.export_history[-inst.appliance_switch_interval:]))
                     log.debug(f'{log_prefix} Home battery charge is not sufficient ({home_battery_level}/{PvExcessControl.min_home_battery_level} %), '
                               f'OR remaining solar forecast is lower than remaining capacity of home battery. '
-                              f'Calculated average excess power based on >> export power <<: {avg_excess_power} W')
+                              f'Calculated median excess power based on >> export power <<: {median_excess_power} W')
 
                 # add instance including calculated excess power to inverted list (priority from low to high)
-                instances.insert(0, {'instance': inst, 'avg_excess_power': avg_excess_power})
+                instances.insert(0, {'instance': inst, 'median_excess_power': median_excess_power})
 
 
                 # -------------------------------------------------------------------
@@ -305,11 +311,11 @@ class PvExcessControl:
                 if _get_state(inst.appliance_switch) == 'on':
                     # check if current of appliance can be increased
                     log.debug(f'{log_prefix} Appliance is already switched on.')
-                    if avg_excess_power >= PvExcessControl.min_excess_power and inst.dynamic_current_appliance:
+                    if minimum_excess_power >= PvExcessControl.min_excess_power and inst.dynamic_current_appliance:
                         # try to increase dynamic current, because excess solar power is available
                         prev_amps = _get_num_state(inst.appliance_current_set_entity, return_on_error=inst.min_current)
                         ## wallboxes usually can do only whole amp numbers - round down
-                        excess_amps = math.floor(avg_excess_power / (PvExcessControl.grid_voltage * inst.phases) + prev_amps)
+                        excess_amps = math.floor(minimum_excess_power / (PvExcessControl.grid_voltage * inst.phases) + prev_amps)
                         amps = max(inst.min_current, min(excess_amps, inst.max_current))
                         if amps > (prev_amps+0.09):
                             _set_value(inst.appliance_current_set_entity, amps)
@@ -325,8 +331,8 @@ class PvExcessControl:
                                     f'Assuming OFF state.')
                     defined_power = inst.defined_current * PvExcessControl.grid_voltage * inst.phases
                     ## add margin to avoid on/off sequences
-                    if avg_excess_power >= defined_power+inst.power_toggle_margin:
-                        log.debug(f'{log_prefix} Average Excess power is high enough to switch on appliance.')
+                    if minimum_excess_power >= defined_power+inst.power_toggle_margin:
+                        log.debug(f'{log_prefix} Excess power is high enough to switch on appliance.')
                         if inst.switch_interval_counter >= inst.appliance_switch_interval:
                             self.switch_on(inst)
                             inst.switch_interval_counter = 0
@@ -340,7 +346,7 @@ class PvExcessControl:
                             log.debug(f'{log_prefix} Cannot switch on appliance, because appliance switch interval is not reached '
                                       f'({inst.switch_interval_counter}/{inst.appliance_switch_interval}).')
                     else:
-                        log.debug(f'{log_prefix} Average Excess power not high enough to switch on appliance.')
+                        log.debug(f'{log_prefix} Excess power not high enough to switch on appliance.')
                 # -------------------------------------------------------------------
 
 
@@ -349,13 +355,13 @@ class PvExcessControl:
             prev_consumption_sum = 0
             for dic in instances:
                 inst = dic['instance']
-                avg_excess_power = dic['avg_excess_power'] + prev_consumption_sum
+                median_excess_power = dic['median_excess_power'] + prev_consumption_sum
                 log_prefix = f'[{inst.appliance_switch} (Prio {inst.appliance_priority})]'
 
                 # -------------------------------------------------------------------
                 if _get_state(inst.appliance_switch) == 'on':
-                    if avg_excess_power < PvExcessControl.min_excess_power:
-                        log.debug(f'{log_prefix} Average Excess Power ({avg_excess_power} W) is less than minimum excess power '
+                    if median_excess_power < PvExcessControl.min_excess_power:
+                        log.debug(f'{log_prefix} Median Excess Power ({median_excess_power} W) is less than minimum excess power '
                                   f'({PvExcessControl.min_excess_power} W).')
 
                         # check if current of dyn. curr. appliance can be reduced
@@ -365,7 +371,7 @@ class PvExcessControl:
                             else:
                                 actual_current = round(_get_num_state(inst.actual_power) / (PvExcessControl.grid_voltage * inst.phases), 1)
                             # round down to avoid overshooting
-                            diff_current = math.floor(avg_excess_power / (PvExcessControl.grid_voltage * inst.phases))
+                            diff_current = math.floor(median_excess_power / (PvExcessControl.grid_voltage * inst.phases))
                             target_current = max(inst.min_current, actual_current + diff_current)
                             log.debug(f'{log_prefix} {actual_current=}A | {diff_current=}A | {target_current=}A')
                             if inst.min_current < target_current < actual_current:
@@ -397,7 +403,7 @@ class PvExcessControl:
                                 log.debug(f'{log_prefix} Added {power_consumption=} W to prev_consumption_sum, '
                                           f'which is now {prev_consumption_sum} W.')
                     else:
-                        log.debug(f'{log_prefix} Average Excess Power ({avg_excess_power} W) is still greater than minimum excess power '
+                        log.debug(f'{log_prefix} Median Excess Power ({median_excess_power} W) is still greater than minimum excess power '
                                   f'({PvExcessControl.min_excess_power} W) - Doing nothing.')
 
 
