@@ -245,7 +245,7 @@ class PvExcessControl:
         @time_trigger('period(now, 10s)')
         def on_time():
             # Sanity check
-            if not self.sanity_check():
+            if (not PvExcessControl.instances) or (not self.sanity_check()):
                 return on_time
 
             # execute only if this the first instance of the dictionary (avoid two automations acting)
